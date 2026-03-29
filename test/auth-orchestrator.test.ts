@@ -1,0 +1,274 @@
+import { afterEach, describe, expect, it } from "vitest";
+
+import { AuthOrchestrator } from "../src/services/auth-orchestrator.js";
+import type { SessionState } from "../src/types.js";
+import { createFixtureServer } from "./fixture-server.js";
+
+class MemorySessionStore {
+  private readonly sessions = new Map<string, SessionState>();
+
+  async getSessionByAccountId(accountId: string): Promise<SessionState | null> {
+    return this.sessions.get(accountId) ?? null;
+  }
+
+  async upsertSession(params: {
+    accountId: string;
+    status: SessionState["status"];
+    state: Record<string, unknown>;
+    storageStatePath?: string;
+    lastAuthenticatedAt?: string;
+    expiresAt?: string;
+  }): Promise<SessionState> {
+    const next: SessionState = {
+      id: this.sessions.get(params.accountId)?.id ?? `session_${params.accountId}`,
+      accountId: params.accountId,
+      status: params.status,
+      state: params.state,
+      storageStatePath: params.storageStatePath,
+      lastAuthenticatedAt: params.lastAuthenticatedAt,
+      expiresAt: params.expiresAt,
+      updatedAt: new Date().toISOString(),
+    };
+    this.sessions.set(params.accountId, next);
+    return next;
+  }
+}
+
+describe("AuthOrchestrator", () => {
+  const servers: Array<Awaited<ReturnType<typeof createFixtureServer>>> = [];
+
+  afterEach(async () => {
+    while (servers.length > 0) {
+      const server = servers.pop();
+      if (server) {
+        await server.close();
+      }
+    }
+  });
+
+  it("authenticates against the fixture login form and persists session state", async () => {
+    const fixture = await createFixtureServer();
+    servers.push(fixture);
+
+    const store = new MemorySessionStore();
+    const orchestrator = new AuthOrchestrator(store);
+    const result = await orchestrator.ensureAuthenticated(
+      {
+        id: "site_fixture",
+        slug: "fixture",
+        name: "Fixture",
+        baseUrl: fixture.baseUrl,
+        objective: "Authenticate",
+        entityType: "Record",
+        fieldList: [],
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      },
+      {
+        id: "acct_fixture",
+        siteId: "site_fixture",
+        label: "default",
+        authMode: "basic",
+        credentials: {
+          username: "demo",
+          password: "secret",
+        },
+        isDefault: true,
+      },
+      {
+        version: 1,
+        connectorType: "url-discovery",
+        entryUrl: `${fixture.baseUrl}/records`,
+        authRequired: true,
+        autoDiscovery: {
+          entityType: "Record",
+          fields: ["title", "url", "summary", "content"],
+          authStrategy: {
+            mode: "form",
+            loginUrl: `${fixture.baseUrl}/login`,
+            usernameSelector: 'input[name="username"]',
+            passwordSelector: 'input[name="password"]',
+            submitSelector: 'button[type="submit"]',
+            successUrlContains: "/records",
+          },
+          pageKinds: [],
+          navigation: {
+            sameOriginOnly: true,
+            maxDepth: 2,
+            maxPages: 10,
+            maxRecords: 10,
+            allowPatterns: [],
+            denyPatterns: [],
+          },
+          verification: {
+            sampleUrls: [],
+            artifacts: [],
+          },
+        },
+      },
+      {
+        mode: "form",
+        credentials: {
+          username: "demo",
+          password: "secret",
+        },
+      },
+    );
+
+    expect(result.status).toBe("succeeded");
+    expect(result.session?.status).toBe("authenticated");
+  });
+
+  it("resolves OTP from a webhook inbox during form login", async () => {
+    const fixture = await createFixtureServer();
+    servers.push(fixture);
+
+    const store = new MemorySessionStore();
+    const orchestrator = new AuthOrchestrator(store);
+    const result = await orchestrator.ensureAuthenticated(
+      {
+        id: "site_fixture_otp",
+        slug: "fixture-otp",
+        name: "Fixture OTP",
+        baseUrl: fixture.baseUrl,
+        objective: "Authenticate with OTP",
+        entityType: "Record",
+        fieldList: [],
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      },
+      {
+        id: "acct_fixture_otp",
+        siteId: "site_fixture_otp",
+        label: "default",
+        authMode: "basic+otp",
+        credentials: {
+          username: "demo",
+          password: "secret",
+        },
+        isDefault: true,
+      },
+      {
+        version: 1,
+        connectorType: "url-discovery",
+        entryUrl: `${fixture.baseUrl}/records-otp`,
+        authRequired: true,
+        autoDiscovery: {
+          entityType: "Record",
+          fields: ["title", "url", "summary", "content"],
+          authStrategy: {
+            mode: "form",
+            loginUrl: `${fixture.baseUrl}/login-otp`,
+            usernameSelector: 'input[name="username"]',
+            passwordSelector: 'input[name="password"]',
+            submitSelector: 'button[type="submit"]',
+            otpSelector: 'input[name="otpCode"]',
+            successUrlContains: "/records-otp",
+          },
+          pageKinds: [],
+          navigation: {
+            sameOriginOnly: true,
+            maxDepth: 2,
+            maxPages: 10,
+            maxRecords: 10,
+            allowPatterns: [],
+            denyPatterns: [],
+          },
+          verification: {
+            sampleUrls: [],
+            artifacts: [],
+          },
+        },
+      },
+      {
+        mode: "form",
+        credentials: {
+          username: "demo",
+          password: "secret",
+        },
+        otp: {
+          mode: "webhook-inbox",
+          config: {
+            url: `${fixture.baseUrl}/otp/latest`,
+            codePath: "code",
+            intervalMs: 100,
+            timeoutMs: 2_000,
+          },
+        },
+      },
+    );
+
+    expect(result.status).toBe("succeeded");
+    expect(result.events.some((event) => event.type === "otp" && event.status === "succeeded")).toBe(true);
+  });
+
+  it("handles a generic oauth browser flow", async () => {
+    const fixture = await createFixtureServer();
+    servers.push(fixture);
+
+    const store = new MemorySessionStore();
+    const orchestrator = new AuthOrchestrator(store);
+    const result = await orchestrator.ensureAuthenticated(
+      {
+        id: "site_fixture_oauth",
+        slug: "fixture-oauth",
+        name: "Fixture OAuth",
+        baseUrl: fixture.baseUrl,
+        objective: "Authenticate with OAuth",
+        entityType: "Record",
+        fieldList: [],
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      },
+      {
+        id: "acct_fixture_oauth",
+        siteId: "site_fixture_oauth",
+        label: "default",
+        authMode: "oauth",
+        credentials: {
+          oauthUsername: "oauth@example.com",
+          oauthPassword: "oauth-secret",
+        },
+        isDefault: true,
+      },
+      {
+        version: 1,
+        connectorType: "url-discovery",
+        entryUrl: `${fixture.baseUrl}/oauth-protected`,
+        authRequired: true,
+        autoDiscovery: {
+          entityType: "Record",
+          fields: ["title", "url", "summary", "content"],
+          authStrategy: {
+            mode: "oauth",
+            oauthTriggerTexts: ["Continue with Google"],
+            successUrlContains: "/oauth-protected/records",
+          },
+          pageKinds: [],
+          navigation: {
+            sameOriginOnly: true,
+            maxDepth: 2,
+            maxPages: 10,
+            maxRecords: 10,
+            allowPatterns: [],
+            denyPatterns: [],
+          },
+          verification: {
+            sampleUrls: [],
+            artifacts: [],
+          },
+        },
+      },
+      {
+        mode: "oauth",
+        credentials: {
+          oauthUsername: "oauth@example.com",
+          oauthPassword: "oauth-secret",
+        },
+      },
+    );
+
+    expect(result.status).toBe("succeeded");
+    expect(result.events.some((event) => event.type === "oauth" && event.status === "succeeded")).toBe(true);
+  });
+});

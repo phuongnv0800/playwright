@@ -1,0 +1,10 @@
+node_modules
+dist
+.env
+.DS_Store
+.playwright
+tmp
+coverage
+playwright-state
+output
+.playwright-cli
