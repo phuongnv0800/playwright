@@ -202,6 +202,86 @@ describe("AuthOrchestrator", () => {
     expect(result.events.some((event) => event.type === "otp" && event.status === "succeeded")).toBe(true);
   });
 
+  it("submits VNPT-style OTP forms that use a text button without submit type", async () => {
+    const fixture = await createFixtureServer();
+    servers.push(fixture);
+
+    const store = new MemorySessionStore();
+    const orchestrator = new AuthOrchestrator(store);
+    const result = await orchestrator.ensureAuthenticated(
+      {
+        id: "site_fixture_vnpt_otp",
+        slug: "fixture-vnpt-otp",
+        name: "Fixture VNPT OTP",
+        baseUrl: fixture.baseUrl,
+        objective: "Authenticate with VNPT-style OTP step",
+        entityType: "Record",
+        fieldList: [],
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      },
+      {
+        id: "acct_fixture_vnpt_otp",
+        siteId: "site_fixture_vnpt_otp",
+        label: "default",
+        authMode: "basic+otp",
+        credentials: {
+          username: "demo",
+          password: "secret",
+        },
+        isDefault: true,
+      },
+      {
+        version: 1,
+        connectorType: "url-discovery",
+        entryUrl: `${fixture.baseUrl}/records-otp-vnpt`,
+        authRequired: true,
+        autoDiscovery: {
+          entityType: "Record",
+          fields: ["title", "url", "summary", "content"],
+          authStrategy: {
+            mode: "form",
+            loginUrl: `${fixture.baseUrl}/login-otp-vnpt`,
+            usernameSelector: 'input[name="username"]',
+            passwordSelector: 'input[name="password"]',
+            submitSelector: 'button[type="submit"]',
+            otpSelector: "#passOTP",
+            successUrlContains: "/records-otp-vnpt",
+          },
+          pageKinds: [],
+          navigation: {
+            sameOriginOnly: true,
+            maxDepth: 2,
+            maxPages: 10,
+            maxRecords: 10,
+            allowPatterns: [],
+            denyPatterns: [],
+          },
+          verification: {
+            sampleUrls: [],
+            artifacts: [],
+          },
+        },
+      },
+      {
+        mode: "form",
+        credentials: {
+          username: "demo",
+          password: "secret",
+        },
+        otp: {
+          mode: "manual",
+          config: {
+            code: "728989",
+          },
+        },
+      },
+    );
+
+    expect(result.status).toBe("succeeded");
+    expect(result.events.some((event) => event.type === "otp" && event.status === "succeeded")).toBe(true);
+  });
+
   it("handles a generic oauth browser flow", async () => {
     const fixture = await createFixtureServer();
     servers.push(fixture);

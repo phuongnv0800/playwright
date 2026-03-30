@@ -38,6 +38,14 @@ interface CaptchaTaskResult {
   provider: string;
 }
 
+interface ChallengeSnapshotState {
+  [key: string]: unknown;
+  reason: string;
+  challengeType?: "oauth" | "otp" | "captcha";
+  challengeUrl?: string;
+  storageState?: Record<string, unknown>;
+}
+
 function normalizeText(value: string | null | undefined): string {
   return (value ?? "").replace(/\s+/g, " ").trim();
 }
@@ -58,12 +66,41 @@ function getByPath(payload: unknown, pathValue: string): unknown {
     }, payload);
 }
 
+function readManualOtpCode(authConfig: CrawlAuthInput): string | null {
+  if (authConfig.otp?.mode !== "manual") {
+    return null;
+  }
+
+  const code = String(authConfig.otp.config.code ?? "").trim();
+  return code || null;
+}
+
 async function safeClick(locator: ReturnType<Page["locator"]>): Promise<boolean> {
   if ((await locator.count()) === 0) {
     return false;
   }
-  await locator.first().click();
-  return true;
+  try {
+    await locator.first().click({
+      timeout: 5_000,
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function safePress(locator: ReturnType<Page["locator"]>, key: string): Promise<boolean> {
+  if ((await locator.count()) === 0) {
+    return false;
+  }
+  try {
+    await locator.first().press(key, {
+      timeout: 5_000,
+    });
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 async function fillFirstExisting(page: Page, selectors: string[], value: string): Promise<string | null> {
@@ -80,9 +117,12 @@ async function fillFirstExisting(page: Page, selectors: string[], value: string)
 
 async function findOtpSelector(page: Page): Promise<string | null> {
   const selectors = [
+    "#passOTP",
+    'input[name="validate_pass_otp"]',
     'input[autocomplete="one-time-code"]',
     'input[name*="otp" i]',
     'input[id*="otp" i]',
+    'input[name*="pass_otp" i]',
     'input[name*="code" i]',
     'input[id*="code" i]',
     'input[type="tel"]',
@@ -160,6 +200,25 @@ export class AuthOrchestrator {
       };
     }
 
+    const authStrategy = recipe.autoDiscovery?.authStrategy ?? {
+      mode: authConfig.mode === "auto" ? "form" : authConfig.mode,
+    };
+    const manualOtpCode = readManualOtpCode(authConfig);
+    const challengeState = current?.state as ChallengeSnapshotState | undefined;
+    const canResumeOtpChallenge =
+      current?.status === "challenge_required" &&
+      challengeState?.challengeType === "otp" &&
+      Boolean(challengeState.storageState) &&
+      Boolean(manualOtpCode);
+
+    if (current?.status === "challenge_required" && !canResumeOtpChallenge) {
+      return {
+        status: "needs_review",
+        reviewReason: challengeState?.reason ?? "Authentication is waiting for manual review.",
+        events: [],
+      };
+    }
+
     const browser = await chromium.launch({
       headless: env.PLAYWRIGHT_HEADLESS,
     });
@@ -167,27 +226,49 @@ export class AuthOrchestrator {
     const events: AuthChallengeEvent[] = [];
 
     try {
-      const context = await browser.newContext();
+      const context = await browser.newContext(
+        canResumeOtpChallenge ? { storageState: challengeState?.storageState as never } : undefined,
+      );
       const page = await context.newPage();
       page.setDefaultTimeout(env.PLAYWRIGHT_DEFAULT_TIMEOUT_MS);
 
-      const authStrategy = recipe.autoDiscovery?.authStrategy ?? {
-        mode: authConfig.mode === "auto" ? "form" : authConfig.mode,
-      };
-
-      await page.goto(authStrategy.loginUrl ?? recipe.entryUrl ?? site.baseUrl, {
-        waitUntil: "domcontentloaded",
-      });
-
-      if (authStrategy.mode === "oauth") {
-        const oauthResult = await this.handleOAuth(page, site, account, authStrategy.oauthTriggerTexts ?? [], authConfig, events);
-        if (oauthResult !== "ok") {
-          return await this.markChallenge(account.id, oauthResult, events);
+      if (canResumeOtpChallenge) {
+        await page.goto(challengeState?.challengeUrl ?? authStrategy.loginUrl ?? recipe.entryUrl ?? site.baseUrl, {
+          waitUntil: "domcontentloaded",
+        });
+        const resumeResult = await this.submitOtpChallenge(page, site, authStrategy.successUrlContains, authConfig, events);
+        if (resumeResult !== "ok") {
+          return await this.markChallenge(account.id, resumeResult, events, context, page, "otp");
         }
-      } else if (authStrategy.mode === "form" || authConfig.mode === "auto") {
-        const formResult = await this.handleFormLogin(page, site, account, authStrategy, authConfig, events);
-        if (formResult !== "ok") {
-          return await this.markChallenge(account.id, formResult, events);
+      } else {
+        await page.goto(authStrategy.loginUrl ?? recipe.entryUrl ?? site.baseUrl, {
+          waitUntil: "domcontentloaded",
+        });
+
+        if (authStrategy.mode === "oauth") {
+          const oauthResult = await this.handleOAuth(page, site, account, authStrategy.oauthTriggerTexts ?? [], authConfig, events);
+          if (oauthResult !== "ok") {
+            return await this.markChallenge(
+              account.id,
+              oauthResult,
+              events,
+              context,
+              page,
+              (await this.detectChallengeType(page, authConfig, events)) ?? "oauth",
+            );
+          }
+        } else if (authStrategy.mode === "form" || authConfig.mode === "auto") {
+          const formResult = await this.handleFormLogin(page, site, account, authStrategy, authConfig, events);
+          if (formResult !== "ok") {
+            return await this.markChallenge(
+              account.id,
+              formResult,
+              events,
+              context,
+              page,
+              await this.detectChallengeType(page, authConfig, events),
+            );
+          }
         }
       }
 
@@ -235,13 +316,36 @@ export class AuthOrchestrator {
     accountId: string,
     reason: string,
     events: AuthChallengeEvent[],
+    context?: BrowserContext,
+    page?: Page,
+    challengeType?: "oauth" | "otp" | "captcha",
   ): Promise<AuthExecutionResult> {
+    let state: ChallengeSnapshotState = {
+      reason,
+      challengeType,
+    };
+    let storageStatePath: string | undefined;
+
+    if (context) {
+      const storageState = (await context.storageState()) as Record<string, unknown>;
+      const stateDir = path.resolve(env.PLAYWRIGHT_STATE_DIR);
+      await mkdir(stateDir, {
+        recursive: true,
+      });
+      storageStatePath = path.join(stateDir, `${accountId}.challenge.json`);
+      await writeFile(storageStatePath, JSON.stringify(storageState, null, 2));
+      state = {
+        ...state,
+        challengeUrl: page?.url(),
+        storageState,
+      };
+    }
+
     await this.store.upsertSession({
       accountId,
       status: "challenge_required",
-      state: {
-        reason,
-      },
+      state,
+      storageStatePath,
     });
 
     return {
@@ -249,6 +353,23 @@ export class AuthOrchestrator {
       reviewReason: reason,
       events,
     };
+  }
+
+  private async detectChallengeType(
+    page: Page,
+    authConfig: CrawlAuthInput,
+    events: AuthChallengeEvent[],
+  ): Promise<"oauth" | "otp" | "captcha" | undefined> {
+    if ((await findOtpSelector(page)) || authConfig.otp) {
+      return "otp";
+    }
+    if (events.some((event) => event.type === "captcha" && event.status === "needs_review")) {
+      return "captcha";
+    }
+    if (events.some((event) => event.type === "oauth")) {
+      return "oauth";
+    }
+    return undefined;
   }
 
   private async handleFormLogin(
@@ -313,39 +434,93 @@ export class AuthOrchestrator {
       }
     }
 
-    if (submitSelector) {
-      await page.locator(submitSelector).first().click();
+    const loginSubmitSelectors = [
+      submitSelector,
+      'button[type="submit"]',
+      'input[type="submit"]',
+      'button:has-text("ĐĂNG NHẬP")',
+      'button:has-text("Đăng nhập")',
+      'button:has-text("Login")',
+      'button:has-text("Sign in")',
+      'button:has-text("Continue")',
+    ].filter((selector): selector is string => Boolean(selector));
+
+    const clickedLoginSubmit = await this.clickFirstExisting(page, loginSubmitSelectors);
+    if (!clickedLoginSubmit) {
+      const submittedByEnter = await safePress(page.locator(passwordSelector), "Enter");
+      if (!submittedByEnter) {
+        return "Unable to submit the login form automatically.";
+      }
     }
 
-    const otpSelector = authStrategy?.otpSelector ?? (await findOtpSelector(page));
-    if (otpSelector) {
-      const otpCode = await this.resolveOtp(authConfig);
-      if (!otpCode) {
-        events.push({
-          type: "otp",
-          status: "needs_review",
-          detail: {
-            mode: authConfig.otp?.mode ?? "unknown",
-          },
-        });
-        return "OTP step detected but no OTP code could be resolved.";
-      }
-      await page.locator(otpSelector).first().fill(otpCode);
+    await page.waitForTimeout(300);
+
+    const otpResult = await this.submitOtpChallenge(page, site, authStrategy?.successUrlContains, authConfig, events, submitSelector);
+    if (otpResult !== "not_present") {
+      return otpResult;
+    }
+
+    const success = await this.waitForSuccess(page, site, authStrategy?.successUrlContains);
+    return success ? "ok" : "Form login did not reach an authenticated state.";
+  }
+
+  private async submitOtpChallenge(
+    page: Page,
+    site: SiteDefinition,
+    successUrlContains: string | undefined,
+    authConfig: CrawlAuthInput,
+    events: AuthChallengeEvent[],
+    submitSelector?: string,
+  ): Promise<"ok" | "not_present" | string> {
+    const otpSelector = await findOtpSelector(page);
+    if (!otpSelector) {
+      return "not_present";
+    }
+
+    const otpCode = await this.resolveOtp(authConfig);
+    if (!otpCode) {
       events.push({
         type: "otp",
-        status: "succeeded",
+        status: "needs_review",
         detail: {
           mode: authConfig.otp?.mode ?? "unknown",
         },
       });
-      const otpSubmitSelectors = ['#verify-otp', 'button:has-text("Verify")', 'button:has-text("Continue")', 'button[type="submit"]', 'input[type="submit"]'];
-      const clickedOtpSubmit = await this.clickFirstExisting(page, otpSubmitSelectors);
-      if (!clickedOtpSubmit && submitSelector) {
-        await page.locator(submitSelector).first().click();
-      }
+      return "OTP step detected but no OTP code could be resolved.";
     }
 
-    const success = await this.waitForSuccess(page, site, authStrategy?.successUrlContains);
+    await page.locator(otpSelector).first().fill(otpCode);
+    events.push({
+      type: "otp",
+      status: "succeeded",
+      detail: {
+        mode: authConfig.otp?.mode ?? "unknown",
+      },
+    });
+
+    const otpSubmitSelectors = [
+      "#verify-otp",
+      'button:has-text("ĐĂNG NHẬP")',
+      'button:has-text("Đăng nhập")',
+      'button:has-text("Xác thực")',
+      'button:has-text("Verify")',
+      'button:has-text("Continue")',
+      'button:has-text("Submit")',
+      'button:has-text("Sign in")',
+      'button[type="submit"]',
+      'input[type="submit"]',
+      "form button",
+    ];
+    const clickedOtpSubmit = await this.clickFirstExisting(page, otpSubmitSelectors);
+    if (!clickedOtpSubmit) {
+      const clickedFallbackSubmit = submitSelector ? await safeClick(page.locator(submitSelector)) : false;
+      if (!clickedFallbackSubmit) {
+        await safePress(page.locator(otpSelector), "Enter");
+      }
+    }
+    await page.waitForTimeout(300);
+
+    const success = await this.waitForSuccess(page, site, successUrlContains);
     return success ? "ok" : "Form login did not reach an authenticated state.";
   }
 
@@ -503,7 +678,7 @@ export class AuthOrchestrator {
             }
             return url.origin === new URL(site.baseUrl).origin && !/login|signin/i.test(url.pathname);
           },
-          { timeout: 10_000 },
+          { timeout: 15_000 },
         ),
     ];
 
@@ -522,6 +697,11 @@ export class AuthOrchestrator {
   private async resolveOtp(authConfig: CrawlAuthInput): Promise<string | null> {
     if (!authConfig.otp) {
       return null;
+    }
+
+    if (authConfig.otp.mode === "manual") {
+      const code = String(authConfig.otp.config.code ?? "").trim();
+      return code || null;
     }
 
     if (authConfig.otp.mode === "totp") {

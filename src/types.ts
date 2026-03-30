@@ -23,7 +23,7 @@ export type CrawlLinkDecision = "queued" | "followed" | "skipped" | "blocked" | 
 
 export type AuthMode = "auto" | "none" | "form" | "oauth";
 
-export type OtpMode = "totp" | "imap" | "webhook-inbox";
+export type OtpMode = "totp" | "imap" | "webhook-inbox" | "manual";
 
 export type CaptchaMode = "2captcha-compatible";
 

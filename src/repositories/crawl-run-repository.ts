@@ -537,12 +537,18 @@ export class CrawlRunRepository {
     return result.rows[0] ? mapCrawlRun(result.rows[0]) : null;
   }
 
+  async listCrawlRuns(limit = 20): Promise<CrawlRun[]> {
+    const result = await this.pool.query("SELECT * FROM crawl_runs ORDER BY created_at DESC LIMIT $1", [limit]);
+    return result.rows.map(mapCrawlRun);
+  }
+
   async updateCrawlRun(crawlRunId: string, patch: {
     status?: CrawlRunStatus;
     discoveryStatus?: PhaseStatus;
     authStatus?: PhaseStatus;
     crawlStatus?: PhaseStatus;
     deliveryStatus?: PhaseStatus | "partial_success";
+    authConfig?: CrawlAuthInput;
     entityType?: EntityType;
     confidence?: number;
     reviewReason?: string | null;
@@ -567,6 +573,7 @@ export class CrawlRunRepository {
     if (patch.authStatus) setValue("auth_status", patch.authStatus);
     if (patch.crawlStatus) setValue("crawl_status", patch.crawlStatus);
     if (patch.deliveryStatus) setValue("delivery_status", patch.deliveryStatus);
+    if (patch.authConfig) setValue("auth_config", JSON.stringify(patch.authConfig));
     if (patch.entityType) setValue("entity_type", patch.entityType);
     if (typeof patch.confidence === "number") setValue("confidence", patch.confidence);
     if (patch.reviewReason !== undefined) setValue("review_reason", patch.reviewReason);
@@ -712,6 +719,14 @@ export class CrawlRunRepository {
     );
 
     return mapChallenge(result.rows[0]);
+  }
+
+  async listChallengeAttempts(crawlRunId: string): Promise<ChallengeAttempt[]> {
+    const result = await this.pool.query(
+      "SELECT * FROM challenge_attempts WHERE crawl_run_id = $1 ORDER BY created_at DESC",
+      [crawlRunId],
+    );
+    return result.rows.map(mapChallenge);
   }
 
   async createExport(params: {

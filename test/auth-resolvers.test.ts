@@ -87,6 +87,22 @@ describe("AuthOrchestrator resolvers", () => {
     expect(code).toBe("112233");
   });
 
+  it("returns a manually submitted OTP code", async () => {
+    const orchestrator = new AuthOrchestrator(new NullSessionStore());
+
+    const code = await (orchestrator as any).resolveOtp({
+      mode: "form",
+      otp: {
+        mode: "manual",
+        config: {
+          code: "654321",
+        },
+      },
+    });
+
+    expect(code).toBe("654321");
+  });
+
   it("solves recaptcha through a 2captcha-compatible provider", async () => {
     const fetchMock = vi
       .fn()

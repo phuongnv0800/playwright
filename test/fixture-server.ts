@@ -127,6 +127,70 @@ export async function createFixtureServer(): Promise<FixtureServer> {
       return;
     }
 
+    if (request.method === "GET" && url.pathname === "/login-otp-vnpt") {
+      response.setHeader("content-type", "text/html; charset=utf-8");
+      response.end(
+        html(`
+          <form id="login-form">
+            <input data-field="username" name="username" />
+            <input data-field="password" type="password" name="password" />
+            <button type="submit">ĐĂNG NHẬP</button>
+          </form>
+          <script>
+            function mountOtpStep() {
+              document.body.innerHTML = \`
+                <form id="loginForm">
+                  <div>Xin vui lòng nhập mã xác thực OTP của bạn</div>
+                  <input id="passOTP" name="validate_pass_otp" type="text" />
+                  <button>ĐĂNG NHẬP</button>
+                </form>
+              \`;
+              document.getElementById("loginForm").addEventListener("submit", (event) => {
+                event.preventDefault();
+                const otpCode = document.getElementById("passOTP").value;
+                if (otpCode === "728989") {
+                  document.cookie = "session_vnpt_otp=ok; path=/";
+                  window.location.href = "/records-otp-vnpt";
+                }
+              });
+            }
+
+            document.getElementById("login-form").addEventListener("submit", (event) => {
+              event.preventDefault();
+              const username = document.querySelector('[data-field="username"]').value;
+              const password = document.querySelector('[data-field="password"]').value;
+              if (username === "demo" && password === "secret") {
+                mountOtpStep();
+              }
+            });
+          </script>
+        `),
+      );
+      return;
+    }
+
+    if (request.method === "GET" && url.pathname === "/records-otp-vnpt") {
+      if (!cookie.includes("session_vnpt_otp=ok")) {
+        response.statusCode = 302;
+        response.setHeader("location", "/login-otp-vnpt");
+        response.end();
+        return;
+      }
+
+      response.setHeader("content-type", "text/html; charset=utf-8");
+      response.end(
+        html(`
+          <main data-authenticated="true">
+            <article>
+              <h1>VNPT-style OTP Protected Records</h1>
+              <p>OTP step uses a text button without type="submit".</p>
+            </article>
+          </main>
+        `),
+      );
+      return;
+    }
+
     if (request.method === "GET" && url.pathname === "/otp/latest") {
       response.setHeader("content-type", "application/json");
       response.end(JSON.stringify({ code: "654321" }));

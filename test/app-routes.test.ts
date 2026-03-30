@@ -29,6 +29,16 @@ function createCrawlRun(id: string): CrawlRun {
     confidence: 0,
     authConfig: {
       mode: "auto",
+      credentials: {
+        username: "demo",
+        password: "secret",
+      },
+      otp: {
+        mode: "manual",
+        config: {
+          code: "123456",
+        },
+      },
     },
     crawlConfig: {
       maxDepth: 2,
@@ -80,6 +90,25 @@ describe("app routes", () => {
       ...crawlRun,
       authStatus: "queued",
     });
+    const submitOtp = vi.fn().mockResolvedValue({
+      ...crawlRun,
+      authStatus: "queued",
+    });
+    const listCrawlRuns = vi.fn().mockResolvedValue([crawlRun]);
+    const getJsonView = vi.fn().mockResolvedValue({
+      crawlRun,
+      job: createJob("job_fixture"),
+      exports: [],
+      pages: [],
+      challenges: [],
+      entities: [],
+      files: {
+        "summary.json": {
+          crawlRunId: crawlRun.id,
+          totalEntities: 0,
+        },
+      },
+    });
     const getExports = vi.fn().mockResolvedValue([
       {
         id: "export_fixture",
@@ -117,9 +146,12 @@ describe("app routes", () => {
 
     const urlCrawlService = {
       enqueueFromUrl,
+      listCrawlRuns,
       getCrawlRun,
+      getJsonView,
       approveCrawlRun,
       retryAuth,
+      submitOtp,
       getExports,
     };
 
@@ -138,6 +170,7 @@ describe("app routes", () => {
     });
 
     expect(createResponse.statusCode).toBe(202);
+    expect(createResponse.json().authConfig.credentials.password).toBe("[REDACTED]");
     expect(enqueueFromUrl).toHaveBeenCalledWith({
       url: "https://example.com/list",
       auth: {
@@ -145,11 +178,27 @@ describe("app routes", () => {
       },
     });
 
+    const listResponse = await app.inject({
+      method: "GET",
+      url: "/crawl-runs?limit=10",
+    });
+    expect(listResponse.statusCode).toBe(200);
+    expect(listCrawlRuns).toHaveBeenCalledWith(10);
+
+    const jsonViewResponse = await app.inject({
+      method: "GET",
+      url: `/crawl-runs/${crawlRun.id}/json-view`,
+    });
+    expect(jsonViewResponse.statusCode).toBe(200);
+    expect(getJsonView).toHaveBeenCalledWith(crawlRun.id);
+
     const getResponse = await app.inject({
       method: "GET",
       url: `/crawl-runs/${crawlRun.id}`,
     });
     expect(getResponse.statusCode).toBe(200);
+    expect(getResponse.json().crawlRun.authConfig.credentials.password).toBe("[REDACTED]");
+    expect(getResponse.json().crawlRun.authConfig.otp.config.code).toBe("[REDACTED]");
     expect(getCrawlRun).toHaveBeenCalledWith(crawlRun.id);
 
     const approveResponse = await app.inject({
@@ -165,6 +214,16 @@ describe("app routes", () => {
     });
     expect(retryResponse.statusCode).toBe(200);
     expect(retryAuth).toHaveBeenCalledWith(crawlRun.id);
+
+    const submitOtpResponse = await app.inject({
+      method: "POST",
+      url: `/crawl-runs/${crawlRun.id}/submit-otp`,
+      payload: {
+        code: "654321",
+      },
+    });
+    expect(submitOtpResponse.statusCode).toBe(200);
+    expect(submitOtp).toHaveBeenCalledWith(crawlRun.id, "654321");
 
     const exportResponse = await app.inject({
       method: "GET",
@@ -194,6 +253,7 @@ describe("app routes", () => {
       }),
       approveCrawlRun: vi.fn(),
       retryAuth: vi.fn(),
+      submitOtp: vi.fn(),
       getExports: vi.fn().mockResolvedValue([]),
     };
 
@@ -206,5 +266,94 @@ describe("app routes", () => {
     });
 
     expect(response.statusCode).toBe(404);
+  });
+
+  it("serves the dashboard shell", async () => {
+    const service = {
+      createSite: vi.fn(),
+      enqueueSiteDiscovery: vi.fn(),
+      publishRecipe: vi.fn(),
+      enqueueSiteRun: vi.fn(),
+      getJob: vi.fn(),
+      approveReview: vi.fn(),
+      testSink: vi.fn(),
+      enqueueSessionReauth: vi.fn(),
+    };
+
+    const urlCrawlService = {
+      enqueueFromUrl: vi.fn(),
+      listCrawlRuns: vi.fn().mockResolvedValue([]),
+      getCrawlRun: vi.fn(),
+      getJsonView: vi.fn(),
+      approveCrawlRun: vi.fn(),
+      retryAuth: vi.fn(),
+      submitOtp: vi.fn(),
+      getExports: vi.fn(),
+    };
+
+    const app = await buildApp(service as never, urlCrawlService as never);
+    apps.push(app);
+
+    const response = await app.inject({
+      method: "GET",
+      url: "/",
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.body).toContain("Control the crawl. Inspect the JSON.");
+  });
+
+  it("normalizes stale phase state for paused crawl runs", async () => {
+    const crawlRun = {
+      ...createCrawlRun("crawl_stale"),
+      status: "needs_review" as const,
+      discoveryStatus: "running" as const,
+      authStatus: "needs_review" as const,
+      reviewReason: "Form login did not reach an authenticated state.",
+    };
+
+    const service = {
+      createSite: vi.fn(),
+      enqueueSiteDiscovery: vi.fn(),
+      publishRecipe: vi.fn(),
+      enqueueSiteRun: vi.fn(),
+      getJob: vi.fn(),
+      approveReview: vi.fn(),
+      testSink: vi.fn(),
+      enqueueSessionReauth: vi.fn(),
+    };
+
+    const urlCrawlService = {
+      enqueueFromUrl: vi.fn(),
+      listCrawlRuns: vi.fn().mockResolvedValue([crawlRun]),
+      getCrawlRun: vi.fn().mockResolvedValue({
+        crawlRun,
+        exports: [],
+      }),
+      getJsonView: vi.fn().mockResolvedValue({
+        crawlRun,
+        job: createJob("job_stale"),
+        exports: [],
+        pages: [],
+        challenges: [],
+        entities: [],
+        files: {},
+      }),
+      approveCrawlRun: vi.fn(),
+      retryAuth: vi.fn(),
+      submitOtp: vi.fn(),
+      getExports: vi.fn(),
+    };
+
+    const app = await buildApp(service as never, urlCrawlService as never);
+    apps.push(app);
+
+    const response = await app.inject({
+      method: "GET",
+      url: "/crawl-runs/crawl_stale",
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json().crawlRun.discoveryStatus).toBe("needs_review");
   });
 });

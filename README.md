@@ -14,10 +14,14 @@ Generic single-tenant browser automation platform built around `Playwright self-
   - `POST /connectors/sinks/test`
   - `POST /sessions/:id/reauth`
   - `POST /crawl-from-url`
+  - `GET /crawl-runs`
   - `GET /crawl-runs/:id`
+  - `GET /crawl-runs/:id/json-view`
   - `POST /crawl-runs/:id/approve`
   - `POST /crawl-runs/:id/retry-auth`
+  - `POST /crawl-runs/:id/submit-otp`
   - `GET /crawl-runs/:id/export`
+  - `GET /`
 - PostgreSQL schema for sites, accounts, recipes, sessions, jobs, artifacts, entities, sinks, templates, deliveries, and logs.
 - `pg-boss` queue on PostgreSQL.
 - Playwright session manager with storage-state persistence.
@@ -58,6 +62,12 @@ docker compose up --build postgres migrate api worker
 ```
 
 ## URL-only crawl API
+
+Open the operator dashboard:
+
+```bash
+open http://localhost:3000
+```
 
 Create a crawl run from a single URL:
 
@@ -101,6 +111,16 @@ If the run stops at `needs_review`, approve it to publish the latest draft recip
 
 ```bash
 curl -X POST http://localhost:3000/crawl-runs/<crawlRunId>/approve
+```
+
+If auth stops at OTP, submit a one-time code and resume the run:
+
+```bash
+curl -X POST http://localhost:3000/crawl-runs/<crawlRunId>/submit-otp \
+  -H 'content-type: application/json' \
+  -d '{
+    "code": "123456"
+  }'
 ```
 
 Get export file paths:
@@ -159,6 +179,31 @@ curl http://localhost:3000/crawl-runs/<crawlRunId>/export
 }
 ```
 
+### VNPT eOffice example
+
+For `https://eoffice.vnpt.vn/qlvbdh/main`, use the generic URL-only flow with form auth. The platform now authenticates first when the seed URL resolves to the VNPT CAS login page, then runs discovery on the authenticated page:
+
+```bash
+curl -X POST http://localhost:3000/crawl-from-url \
+  -H 'content-type: application/json' \
+  -d '{
+    "url": "https://eoffice.vnpt.vn/qlvbdh/main",
+    "auth": {
+      "mode": "form",
+      "credentials": {
+        "username": "'"$EOFFICE_USERNAME"'",
+        "password": "'"$EOFFICE_PASSWORD"'"
+      }
+    },
+    "crawl": {
+      "maxDepth": 1,
+      "maxPages": 50,
+      "maxRecords": 100,
+      "sameOriginOnly": true
+    }
+  }'
+```
+
 ### AI providers
 
 - `AI_PROVIDER=stub`: deterministic heuristic fallback
@@ -210,8 +255,3 @@ Then:
 - OTP/CAPTCHA is intentionally hybrid in v1. If the login recipe has an OTP selector but no `otpCode` in account credentials, the session is marked `challenge_required`.
 - Full UI, multi-tenant isolation, and automated challenge solvers remain phase-2 work.
 - `POST /crawl-from-url` is the preferred v1 entrypoint for URL-only discovery and mini-site crawl. The older `/sites` flow remains available for manually curated recipes.
-
-## Site-specific crawler example
-
-- `npm run crawl:dautoeic:reading` crawls [https://dautoeic.com/reading](https://dautoeic.com/reading) into `output/dautoeic-reading`.
-- Full usage notes are in `/Users/phuongnv/Downloads/project/playwright/README-dautoeic-reading.md`.

@@ -3,6 +3,7 @@ import { z } from "zod";
 
 import type { PlatformService } from "../services/platform-service.js";
 import type { UrlCrawlService } from "../services/url-crawl-service.js";
+import type { CrawlRun } from "../types.js";
 
 const createSiteSchema = z.object({
   slug: z.string().min(2),
@@ -39,7 +40,7 @@ const crawlFromUrlSchema = z.object({
       credentials: z.record(z.unknown()).optional(),
       otp: z
         .object({
-          mode: z.enum(["totp", "imap", "webhook-inbox"]),
+          mode: z.enum(["totp", "imap", "webhook-inbox", "manual"]),
           config: z.record(z.unknown()).default({}),
         })
         .optional(),
@@ -68,6 +69,93 @@ const crawlFromUrlSchema = z.object({
     })
     .optional(),
 });
+
+const submitOtpSchema = z.object({
+  code: z.string().trim().min(4).max(12),
+});
+
+function redactValue(value: unknown): unknown {
+  if (Array.isArray(value)) {
+    return value.map((item) => redactValue(item));
+  }
+  if (!value || typeof value !== "object") {
+    return value;
+  }
+
+  const result: Record<string, unknown> = {};
+  for (const [key, entry] of Object.entries(value)) {
+    if (/(password|secret|token|otp|code|api[_-]?key|^key$)/i.test(key)) {
+      result[key] = "[REDACTED]";
+      continue;
+    }
+    result[key] = redactValue(entry);
+  }
+  return result;
+}
+
+function normalizeCrawlRun(crawlRun: CrawlRun): CrawlRun {
+  const normalized: CrawlRun = {
+    ...crawlRun,
+  };
+
+  if (normalized.status === "needs_review") {
+    if (normalized.authStatus === "needs_review" && normalized.discoveryStatus === "running") {
+      normalized.discoveryStatus = normalized.publishedRecipeVersion ? "succeeded" : "needs_review";
+    }
+
+    if (normalized.discoveryStatus === "running") {
+      normalized.discoveryStatus = "needs_review";
+    }
+
+    if (normalized.crawlStatus === "running") {
+      normalized.crawlStatus = "queued";
+    }
+
+    if (normalized.deliveryStatus === "running") {
+      normalized.deliveryStatus = "queued";
+    }
+  }
+
+  if (normalized.status === "failed") {
+    if (normalized.discoveryStatus === "running") {
+      normalized.discoveryStatus = "failed";
+    }
+    if (normalized.authStatus === "running") {
+      normalized.authStatus = "failed";
+    }
+    if (normalized.crawlStatus === "running") {
+      normalized.crawlStatus = "failed";
+    }
+    if (normalized.deliveryStatus === "running") {
+      normalized.deliveryStatus = "failed";
+    }
+  }
+
+  return normalized;
+}
+
+function toPublicCrawlRun(crawlRun: CrawlRun): CrawlRun {
+  const normalized = normalizeCrawlRun(crawlRun);
+  return {
+    ...normalized,
+    authConfig: {
+      ...normalized.authConfig,
+      credentials: normalized.authConfig.credentials ? (redactValue(normalized.authConfig.credentials) as Record<string, unknown>) : undefined,
+      otp: normalized.authConfig.otp
+        ? {
+            ...normalized.authConfig.otp,
+            config: redactValue(normalized.authConfig.otp.config) as Record<string, unknown>,
+          }
+        : undefined,
+      captcha: normalized.authConfig.captcha
+        ? {
+            ...normalized.authConfig.captcha,
+            config: redactValue(normalized.authConfig.captcha.config) as Record<string, unknown>,
+          }
+        : undefined,
+    },
+  };
+}
 
 export async function registerPlatformRoutes(
   app: FastifyInstance,
@@ -142,7 +230,37 @@ export async function registerPlatformRoutes(
     const body = crawlFromUrlSchema.parse(request.body);
     const crawlRun = await urlCrawlService.enqueueFromUrl(body);
     reply.code(202);
-    return crawlRun;
+    return toPublicCrawlRun(crawlRun);
+  });
+
+  app.get("/crawl-runs", async (request) => {
+    const query = z
+      .object({
+        limit: z.coerce.number().int().positive().max(100).optional(),
+      })
+      .parse(request.query);
+    const runs = await urlCrawlService.listCrawlRuns(query.limit ?? 20);
+    return runs.map((crawlRun) => toPublicCrawlRun(crawlRun));
+  });
+
+  app.get("/crawl-runs/:id/json-view", async (request, reply) => {
+    const params = z.object({ id: z.string().min(1) }).parse(request.params);
+    const result = await urlCrawlService.getJsonView(params.id).catch((error) => {
+      if (error instanceof Error && /not found/i.test(error.message)) {
+        return null;
+      }
+      throw error;
+    });
+    if (!result) {
+      reply.code(404);
+      return {
+        message: "Crawl run not found",
+      };
+    }
+    return {
+      ...result,
+      crawlRun: toPublicCrawlRun(result.crawlRun),
+    };
   });
 
   app.get("/crawl-runs/:id", async (request, reply) => {
@@ -154,17 +272,26 @@ export async function registerPlatformRoutes(
         message: "Crawl run not found",
       };
     }
-    return result;
+    return {
+      ...result,
+      crawlRun: toPublicCrawlRun(result.crawlRun),
+    };
   });
 
   app.post("/crawl-runs/:id/approve", async (request) => {
     const params = z.object({ id: z.string().min(1) }).parse(request.params);
-    return urlCrawlService.approveCrawlRun(params.id);
+    return toPublicCrawlRun(await urlCrawlService.approveCrawlRun(params.id));
   });
 
   app.post("/crawl-runs/:id/retry-auth", async (request) => {
     const params = z.object({ id: z.string().min(1) }).parse(request.params);
-    return urlCrawlService.retryAuth(params.id);
+    return toPublicCrawlRun(await urlCrawlService.retryAuth(params.id));
+  });
+
+  app.post("/crawl-runs/:id/submit-otp", async (request) => {
+    const params = z.object({ id: z.string().min(1) }).parse(request.params);
+    const body = submitOtpSchema.parse(request.body);
+    return toPublicCrawlRun(await urlCrawlService.submitOtp(params.id, body.code));
   });
 
   app.get("/crawl-runs/:id/export", async (request, reply) => {

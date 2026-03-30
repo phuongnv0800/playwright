@@ -1,4 +1,4 @@
-import { mkdir, writeFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 
 import { chromium, type BrowserContext, type Locator, type Page } from "playwright";
@@ -13,6 +13,7 @@ import type { PlatformQueue } from "./platform-queue.js";
 import { queueNames } from "./platform-queue.js";
 import type {
   AIProvider,
+  AutoDiscoveryAuthStrategy,
   CrawlAuthInput,
   CrawlConfig,
   CrawlPageKind,
@@ -83,6 +84,20 @@ function sameOrigin(originA: string, originB: string): boolean {
   return new URL(originA).origin === new URL(originB).origin;
 }
 
+function clearManualOtpCode(authConfig: CrawlAuthInput): CrawlAuthInput {
+  if (authConfig.otp?.mode !== "manual") {
+    return authConfig;
+  }
+
+  return {
+    ...authConfig,
+    otp: {
+      ...authConfig.otp,
+      config: {},
+    },
+  };
+}
+
 function shouldDenyUrl(url: string, denyPatterns: string[]): string | null {
   for (const pattern of denyPatterns) {
     const regex = new RegExp(pattern, "i");
@@ -91,6 +106,83 @@ function shouldDenyUrl(url: string, denyPatterns: string[]): string | null {
     }
   }
   return null;
+}
+
+function inferBootstrapAuthStrategy(seedUrl: string, profile: PageHeuristicProfile, authConfig: CrawlAuthInput): AutoDiscoveryAuthStrategy {
+  if (authConfig.mode === "none") {
+    return {
+      mode: "none",
+    };
+  }
+
+  const successUrlContains = new URL(seedUrl).pathname || "/";
+  const oauthTexts = profile.links
+    .map((link) => link.text.trim())
+    .filter((text) => /(google|microsoft|oauth|sso|continue with|sign in with)/i.test(text))
+    .slice(0, 3);
+
+  if (authConfig.mode === "oauth" || (authConfig.mode === "auto" && oauthTexts.length > 0 && !profile.hasPasswordForm)) {
+    return {
+      mode: "oauth",
+      loginUrl: profile.url,
+      oauthTriggerTexts: oauthTexts.length > 0 ? oauthTexts : undefined,
+      successUrlContains,
+    };
+  }
+
+  return {
+    mode: "form",
+    loginUrl: profile.url,
+    successUrlContains,
+  };
+}
+
+export function shouldBootstrapAuthentication(seedUrl: string, authConfig: CrawlAuthInput, profile: PageHeuristicProfile): boolean {
+  if (authConfig.mode === "none") {
+    return false;
+  }
+
+  if (profile.hasPasswordForm) {
+    return true;
+  }
+
+  const authText = [profile.url, profile.title, profile.textExcerpt].join(" ");
+  if (/(login|sign[\s-]?in|đăng nhập|authentication|oauth|sso|cas)/i.test(authText)) {
+    return true;
+  }
+
+  return !sameOrigin(profile.url, seedUrl);
+}
+
+export function buildBootstrapAuthRecipe(
+  site: SiteDefinition,
+  seedUrl: string,
+  authConfig: CrawlAuthInput,
+  profile: PageHeuristicProfile,
+): SourceRecipe {
+  return {
+    version: 0,
+    connectorType: "url-discovery",
+    entryUrl: seedUrl,
+    authRequired: authConfig.mode !== "none",
+    autoDiscovery: {
+      entityType: site.entityType,
+      fields: site.fieldList.length > 0 ? site.fieldList : ["title", "url", "summary", "content"],
+      authStrategy: inferBootstrapAuthStrategy(seedUrl, profile, authConfig),
+      pageKinds: [],
+      navigation: {
+        ...defaultCrawlConfig,
+        allowPatterns: ["^https?://"],
+        denyPatterns: ["logout", "signout", "delete", "remove", "mailto:", "tel:"],
+      },
+      verification: {
+        sampleUrls: [seedUrl, profile.url],
+        artifacts: ["bootstrap-auth"],
+        notes: "Temporary auth bootstrap recipe used before discovery on protected sites.",
+      },
+    },
+    notes: "Bootstrap auth recipe",
+  };
 }
 
 async function readText(locator: Locator, selector: string): Promise<string | undefined> {
@@ -181,6 +273,54 @@ export class UrlCrawlService {
     };
   }
 
+  async listCrawlRuns(limit = 20): Promise<CrawlRun[]> {
+    return this.deps.crawlRepository.listCrawlRuns(limit);
+  }
+
+  async getJsonView(crawlRunId: string): Promise<{
+    crawlRun: CrawlRun;
+    job: Awaited<ReturnType<PlatformRepository["getJob"]>>;
+    exports: Awaited<ReturnType<CrawlRunRepository["listExports"]>>;
+    pages: Awaited<ReturnType<CrawlRunRepository["listCrawlPages"]>>;
+    challenges: Awaited<ReturnType<CrawlRunRepository["listChallengeAttempts"]>>;
+    entities: Awaited<ReturnType<CrawlRunRepository["listEntitiesByJobId"]>>;
+    files: Record<string, unknown>;
+  }> {
+    const crawlRun = await this.requireCrawlRun(crawlRunId);
+    const [job, exports, pages, challenges, entities] = await Promise.all([
+      this.deps.platformRepository.getJob(crawlRun.jobId),
+      this.deps.crawlRepository.listExports(crawlRun.id),
+      this.deps.crawlRepository.listCrawlPages(crawlRun.id),
+      this.deps.crawlRepository.listChallengeAttempts(crawlRun.id),
+      this.deps.crawlRepository.listEntitiesByJobId(crawlRun.jobId),
+    ]);
+
+    const files: Record<string, unknown> = {};
+    for (const entry of exports) {
+      if (!entry.exportType.endsWith(".json")) {
+        continue;
+      }
+      try {
+        files[entry.exportType] = JSON.parse(await readFile(entry.path, "utf8")) as unknown;
+      } catch {
+        files[entry.exportType] = {
+          error: "Unable to read export file",
+          path: entry.path,
+        };
+      }
+    }
+
+    return {
+      crawlRun,
+      job,
+      exports,
+      pages,
+      challenges,
+      entities,
+      files,
+    };
+  }
+
   async approveCrawlRun(crawlRunId: string): Promise<CrawlRun> {
     const crawlRun = await this.requireCrawlRun(crawlRunId);
     const nextVersion = await this.deps.platformRepository.getNextRecipeVersion(crawlRun.siteId);
@@ -224,18 +364,47 @@ export class UrlCrawlService {
 
   async retryAuth(crawlRunId: string): Promise<CrawlRun> {
     const crawlRun = await this.requireCrawlRun(crawlRunId);
+    const nextAuthConfig = clearManualOtpCode(crawlRun.authConfig);
+    return this.requeueCrawlRun(crawlRun, {
+      seedUrl: crawlRun.seedUrl,
+      retryAuth: true,
+    }, nextAuthConfig);
+  }
+
+  async submitOtp(crawlRunId: string, code: string): Promise<CrawlRun> {
+    const crawlRun = await this.requireCrawlRun(crawlRunId);
+    const nextAuthConfig: CrawlAuthInput = {
+      ...crawlRun.authConfig,
+      otp: {
+        mode: "manual",
+        config: {
+          code,
+        },
+      },
+    };
+    return this.requeueCrawlRun(
+      crawlRun,
+      {
+        seedUrl: crawlRun.seedUrl,
+        retryAuth: true,
+        manualOtp: true,
+      },
+      nextAuthConfig,
+    );
+  }
+
+  private async requeueCrawlRun(crawlRun: CrawlRun, payload: Record<string, unknown>, authConfig = crawlRun.authConfig): Promise<CrawlRun> {
     const job = await this.deps.platformRepository.createJob({
       siteId: crawlRun.siteId,
       jobType: "crawl.url",
-      payload: {
-        seedUrl: crawlRun.seedUrl,
-        retryAuth: true,
-      },
+      payload,
     });
 
     const updated = await this.deps.crawlRepository.updateCrawlRun(crawlRun.id, {
       jobId: job.id,
       status: "queued",
+      authConfig,
+      discoveryStatus: "queued",
       authStatus: "queued",
       crawlStatus: "queued",
       deliveryStatus: "queued",
@@ -281,8 +450,28 @@ export class UrlCrawlService {
 
       if (!recipe) {
         const bootstrap = await this.captureProfiles(site, crawlRun, undefined);
+        let discoverySeed = bootstrap.seedProfile;
+        let discoverySamples = bootstrap.sampleProfiles;
         verificationSeed = bootstrap.seedProfile;
-        const plan = await this.planRecipe(site, crawlRun, bootstrap.seedProfile, bootstrap.sampleProfiles);
+
+        if (shouldBootstrapAuthentication(crawlRun.seedUrl, crawlRun.authConfig, bootstrap.seedProfile)) {
+          const bootstrapRecipe = buildBootstrapAuthRecipe(site, crawlRun.seedUrl, crawlRun.authConfig, bootstrap.seedProfile);
+          const authResult = await this.runAuthIfNeeded(site, account, bootstrapRecipe, crawlRun);
+          if (authResult.status !== "ready") {
+            await this.deps.crawlRepository.updateCrawlRun(crawlRun.id, {
+              discoveryStatus: "needs_review",
+              crawlStatus: "queued",
+              deliveryStatus: "queued",
+            });
+            return;
+          }
+          const authenticatedBootstrap = await this.captureProfiles(site, crawlRun, authResult.accountSession);
+          discoverySeed = authenticatedBootstrap.seedProfile;
+          discoverySamples = authenticatedBootstrap.sampleProfiles;
+          verificationSeed = authenticatedBootstrap.seedProfile;
+        }
+
+        const plan = await this.planRecipe(site, crawlRun, discoverySeed, discoverySamples);
         const discoveryOutcome = await this.persistRecipeDecision(site, crawlRun, plan);
         if (discoveryOutcome.status !== "ready" || !discoveryOutcome.recipe) {
           return;
@@ -291,6 +480,11 @@ export class UrlCrawlService {
       } else {
         const authResult = await this.runAuthIfNeeded(site, account, recipe.recipe, crawlRun);
         if (authResult.status !== "ready") {
+          await this.deps.crawlRepository.updateCrawlRun(crawlRun.id, {
+            discoveryStatus: "succeeded",
+            crawlStatus: "queued",
+            deliveryStatus: "queued",
+          });
           return;
         }
         const bootstrap = await this.captureProfiles(site, crawlRun, authResult.accountSession);
@@ -318,6 +512,11 @@ export class UrlCrawlService {
 
       const authResult = await this.runAuthIfNeeded(site, account, recipe.recipe, crawlRun);
       if (authResult.status !== "ready") {
+        await this.deps.crawlRepository.updateCrawlRun(crawlRun.id, {
+          discoveryStatus: "succeeded",
+          crawlStatus: "queued",
+          deliveryStatus: "queued",
+        });
         return;
       }
 
@@ -492,6 +691,9 @@ export class UrlCrawlService {
     });
 
     const result = await this.deps.authOrchestrator.ensureAuthenticated(site, account, recipe, crawlRun.authConfig);
+    const manualOtpAttempted =
+      crawlRun.authConfig.otp?.mode === "manual" && String(crawlRun.authConfig.otp.config.code ?? "").trim().length > 0;
+    const nextAuthConfig = clearManualOtpCode(crawlRun.authConfig);
     for (const event of result.events) {
       await this.deps.crawlRepository.recordChallengeAttempt({
         crawlRunId: crawlRun.id,
@@ -500,10 +702,22 @@ export class UrlCrawlService {
         detail: event.detail,
       });
     }
+    if (manualOtpAttempted && result.status === "needs_review") {
+      await this.deps.crawlRepository.recordChallengeAttempt({
+        crawlRunId: crawlRun.id,
+        challengeType: "otp",
+        status: "needs_review",
+        detail: {
+          mode: "manual",
+          action: "resubmit_required",
+        },
+      });
+    }
 
     if (result.status === "succeeded") {
       await this.deps.crawlRepository.updateCrawlRun(crawlRun.id, {
         authStatus: "succeeded",
+        authConfig: nextAuthConfig,
       });
       return {
         status: "ready",
@@ -520,7 +734,13 @@ export class UrlCrawlService {
     await this.deps.crawlRepository.updateCrawlRun(crawlRun.id, {
       status: result.status === "needs_review" ? "needs_review" : "failed",
       authStatus: result.status === "needs_review" ? "needs_review" : "failed",
-      reviewReason: result.reviewReason ?? null,
+      authConfig: nextAuthConfig,
+      reviewReason:
+        result.status === "needs_review" &&
+        crawlRun.authConfig.otp?.mode === "manual" &&
+        String(crawlRun.authConfig.otp.config.code ?? "").trim()
+          ? "OTP da duoc dung 1 lan va da duoc xoa. Hay nhap OTP moi de thu lai."
+          : (result.reviewReason ?? null),
       markFinished: result.status !== "needs_review",
     });
     return {
