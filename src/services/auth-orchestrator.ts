@@ -2,7 +2,7 @@ import { mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
 
 import { ImapFlow } from "imapflow";
-import { chromium, type BrowserContext, type Page } from "playwright";
+import { chromium, type Browser, type BrowserContext, type Page } from "playwright";
 
 import { env } from "../config/env.js";
 import { generateTotpCode } from "../lib/totp.js";
@@ -45,6 +45,15 @@ interface ChallengeSnapshotState {
   challengeUrl?: string;
   storageState?: Record<string, unknown>;
 }
+
+interface LiveChallengeSession {
+  browser: Browser;
+  context: BrowserContext;
+  page: Page;
+  challengeType: "oauth" | "otp" | "captcha";
+}
+
+const liveChallenges = new Map<string, LiveChallengeSession>();
 
 function normalizeText(value: string | null | undefined): string {
   return (value ?? "").replace(/\s+/g, " ").trim();
@@ -178,6 +187,35 @@ async function fillExistingSelector(page: Page, selectors: string[]): Promise<st
 export class AuthOrchestrator {
   constructor(private readonly store: SessionStore) {}
 
+  private getLiveChallenge(accountId: string): LiveChallengeSession | null {
+    return liveChallenges.get(accountId) ?? null;
+  }
+
+  private async replaceLiveChallenge(accountId: string, next: LiveChallengeSession): Promise<void> {
+    const current = liveChallenges.get(accountId);
+    const isSameSession =
+      current &&
+      current.browser === next.browser &&
+      current.context === next.context &&
+      current.page === next.page &&
+      current.challengeType === next.challengeType;
+    if (current && !isSameSession) {
+      await this.disposeLiveChallenge(accountId);
+    }
+    liveChallenges.set(accountId, next);
+  }
+
+  private async disposeLiveChallenge(accountId: string): Promise<void> {
+    const current = liveChallenges.get(accountId);
+    if (!current) {
+      return;
+    }
+    liveChallenges.delete(accountId);
+    await current.page.close().catch(() => undefined);
+    await current.context.close().catch(() => undefined);
+    await current.browser.close().catch(() => undefined);
+  }
+
   async ensureAuthenticated(
     site: SiteDefinition,
     account: SiteAccount | null,
@@ -205,39 +243,59 @@ export class AuthOrchestrator {
     };
     const manualOtpCode = readManualOtpCode(authConfig);
     const challengeState = current?.state as ChallengeSnapshotState | undefined;
+    const liveChallenge = current?.status === "challenge_required" ? this.getLiveChallenge(account.id) : null;
     const canResumeOtpChallenge =
       current?.status === "challenge_required" &&
       challengeState?.challengeType === "otp" &&
-      Boolean(challengeState.storageState) &&
+      Boolean(liveChallenge) &&
       Boolean(manualOtpCode);
 
     if (current?.status === "challenge_required" && !canResumeOtpChallenge) {
       return {
         status: "needs_review",
-        reviewReason: challengeState?.reason ?? "Authentication is waiting for manual review.",
+        reviewReason:
+          challengeState?.reason ??
+          (challengeState?.challengeType === "otp"
+            ? "OTP challenge is waiting for a fresh code."
+            : "Authentication is waiting for manual review."),
         events: [],
       };
     }
 
-    const browser = await chromium.launch({
-      headless: env.PLAYWRIGHT_HEADLESS,
-    });
-
     const events: AuthChallengeEvent[] = [];
+    let browser: Browser | null = null;
+    let keepLiveChallenge = false;
+    let usingLiveChallenge = false;
 
     try {
-      const context = await browser.newContext(
-        canResumeOtpChallenge ? { storageState: challengeState?.storageState as never } : undefined,
-      );
-      const page = await context.newPage();
-      page.setDefaultTimeout(env.PLAYWRIGHT_DEFAULT_TIMEOUT_MS);
+      let context: BrowserContext;
+      let page: Page;
+
+      if (canResumeOtpChallenge && liveChallenge) {
+        usingLiveChallenge = true;
+        browser = liveChallenge.browser;
+        context = liveChallenge.context;
+        page = liveChallenge.page;
+        page.setDefaultTimeout(env.PLAYWRIGHT_DEFAULT_TIMEOUT_MS);
+      } else {
+        browser = await chromium.launch({
+          headless: env.PLAYWRIGHT_HEADLESS,
+        });
+        context = await browser.newContext();
+        page = await context.newPage();
+        page.setDefaultTimeout(env.PLAYWRIGHT_DEFAULT_TIMEOUT_MS);
+      }
 
       if (canResumeOtpChallenge) {
-        await page.goto(challengeState?.challengeUrl ?? authStrategy.loginUrl ?? recipe.entryUrl ?? site.baseUrl, {
-          waitUntil: "domcontentloaded",
-        });
         const resumeResult = await this.submitOtpChallenge(page, site, authStrategy.successUrlContains, authConfig, events);
         if (resumeResult !== "ok") {
+          keepLiveChallenge = true;
+          await this.replaceLiveChallenge(account.id, {
+            browser,
+            context,
+            page,
+            challengeType: "otp",
+          });
           return await this.markChallenge(account.id, resumeResult, events, context, page, "otp");
         }
       } else {
@@ -248,25 +306,45 @@ export class AuthOrchestrator {
         if (authStrategy.mode === "oauth") {
           const oauthResult = await this.handleOAuth(page, site, account, authStrategy.oauthTriggerTexts ?? [], authConfig, events);
           if (oauthResult !== "ok") {
+            const challengeType = (await this.detectChallengeType(page, authConfig, events)) ?? "oauth";
+            keepLiveChallenge = challengeType === "otp";
+            if (keepLiveChallenge) {
+              await this.replaceLiveChallenge(account.id, {
+                browser,
+                context,
+                page,
+                challengeType,
+              });
+            }
             return await this.markChallenge(
               account.id,
               oauthResult,
               events,
               context,
               page,
-              (await this.detectChallengeType(page, authConfig, events)) ?? "oauth",
+              challengeType,
             );
           }
         } else if (authStrategy.mode === "form" || authConfig.mode === "auto") {
           const formResult = await this.handleFormLogin(page, site, account, authStrategy, authConfig, events);
           if (formResult !== "ok") {
+            const challengeType = await this.detectChallengeType(page, authConfig, events);
+            keepLiveChallenge = challengeType === "otp";
+            if (keepLiveChallenge && challengeType) {
+              await this.replaceLiveChallenge(account.id, {
+                browser,
+                context,
+                page,
+                challengeType,
+              });
+            }
             return await this.markChallenge(
               account.id,
               formResult,
               events,
               context,
               page,
-              await this.detectChallengeType(page, authConfig, events),
+              challengeType,
             );
           }
         }
@@ -287,6 +365,7 @@ export class AuthOrchestrator {
         storageStatePath,
         lastAuthenticatedAt: new Date().toISOString(),
       });
+      await this.disposeLiveChallenge(account.id);
 
       return {
         status: "succeeded",
@@ -308,7 +387,13 @@ export class AuthOrchestrator {
         events,
       };
     } finally {
-      await browser.close();
+      if (!keepLiveChallenge) {
+        if (usingLiveChallenge) {
+          await this.disposeLiveChallenge(account.id);
+        } else {
+          await browser?.close().catch(() => undefined);
+        }
+      }
     }
   }
 
@@ -518,7 +603,13 @@ export class AuthOrchestrator {
         await safePress(page.locator(otpSelector), "Enter");
       }
     }
-    await page.waitForTimeout(300);
+    const challengeUrl = page.url();
+    await page.waitForTimeout(800);
+
+    const otpStillPresent = await findOtpSelector(page);
+    if (otpStillPresent && page.url() === challengeUrl) {
+      return "Form login did not reach an authenticated state.";
+    }
 
     const success = await this.waitForSuccess(page, site, successUrlContains);
     return success ? "ok" : "Form login did not reach an authenticated state.";

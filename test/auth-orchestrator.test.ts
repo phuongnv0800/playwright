@@ -282,6 +282,117 @@ describe("AuthOrchestrator", () => {
     expect(result.events.some((event) => event.type === "otp" && event.status === "succeeded")).toBe(true);
   });
 
+  it("resumes the same OTP challenge without triggering a new OTP issue on submit", async () => {
+    const fixture = await createFixtureServer();
+    servers.push(fixture);
+
+    const store = new MemorySessionStore();
+    const orchestrator = new AuthOrchestrator(store);
+    const site = {
+      id: "site_fixture_live_otp",
+      slug: "fixture-live-otp",
+      name: "Fixture Live OTP",
+      baseUrl: fixture.baseUrl,
+      objective: "Resume OTP challenge in-place",
+      entityType: "Record" as const,
+      fieldList: [],
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    };
+    const account = {
+      id: "acct_fixture_live_otp",
+      siteId: "site_fixture_live_otp",
+      label: "default",
+      authMode: "basic+otp" as const,
+      credentials: {
+        username: "demo",
+        password: "secret",
+      },
+      isDefault: true,
+    };
+    const recipe = {
+      version: 1,
+      connectorType: "url-discovery" as const,
+      entryUrl: `${fixture.baseUrl}/records-otp-live`,
+      authRequired: true,
+      autoDiscovery: {
+        entityType: "Record" as const,
+        fields: ["title", "url", "summary", "content"],
+        authStrategy: {
+          mode: "form" as const,
+          loginUrl: `${fixture.baseUrl}/login-otp-live`,
+          usernameSelector: 'input[name="username"]',
+          passwordSelector: 'input[name="password"]',
+          submitSelector: 'button[type="submit"]',
+          otpSelector: "#passOTP",
+          successUrlContains: "/records-otp-live",
+        },
+        pageKinds: [],
+        navigation: {
+          sameOriginOnly: true,
+          maxDepth: 2,
+          maxPages: 10,
+          maxRecords: 10,
+          allowPatterns: [],
+          denyPatterns: [],
+        },
+        verification: {
+          sampleUrls: [],
+          artifacts: [],
+        },
+      },
+    };
+
+    const firstResult = await orchestrator.ensureAuthenticated(site, account, recipe, {
+      mode: "form",
+      credentials: {
+        username: "demo",
+        password: "secret",
+      },
+      otp: {
+        mode: "manual",
+        config: {},
+      },
+    });
+
+    expect(firstResult.status).toBe("needs_review");
+    expect(fixture.otpIssueCount).toBe(1);
+
+    const wrongOtpResult = await orchestrator.ensureAuthenticated(site, account, recipe, {
+      mode: "form",
+      credentials: {
+        username: "demo",
+        password: "secret",
+      },
+      otp: {
+        mode: "manual",
+        config: {
+          code: "111111",
+        },
+      },
+    });
+
+    expect(wrongOtpResult.status).toBe("needs_review");
+    expect(fixture.otpIssueCount).toBe(1);
+
+    const successResult = await orchestrator.ensureAuthenticated(site, account, recipe, {
+      mode: "form",
+      credentials: {
+        username: "demo",
+        password: "secret",
+      },
+      otp: {
+        mode: "manual",
+        config: {
+          code: "728989",
+        },
+      },
+    });
+
+    expect(successResult.status).toBe("succeeded");
+    expect(fixture.otpIssueCount).toBe(1);
+  }, 20_000);
+
   it("handles a generic oauth browser flow", async () => {
     const fixture = await createFixtureServer();
     servers.push(fixture);

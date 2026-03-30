@@ -3,6 +3,7 @@ import http from "node:http";
 interface FixtureServer {
   baseUrl: string;
   deliveries: Array<Record<string, unknown>>;
+  otpIssueCount: number;
   close(): Promise<void>;
 }
 
@@ -12,6 +13,7 @@ function html(body: string): string {
 
 export async function createFixtureServer(): Promise<FixtureServer> {
   const deliveries: Array<Record<string, unknown>> = [];
+  let otpIssueCount = 0;
 
   const server = http.createServer(async (request, response) => {
     const url = new URL(request.url ?? "/", "http://127.0.0.1");
@@ -191,6 +193,82 @@ export async function createFixtureServer(): Promise<FixtureServer> {
       return;
     }
 
+    if (request.method === "GET" && url.pathname === "/login-otp-live") {
+      response.setHeader("content-type", "text/html; charset=utf-8");
+      response.end(
+        html(`
+          <form id="login-form">
+            <input data-field="username" name="username" />
+            <input data-field="password" type="password" name="password" />
+            <button type="submit">ĐĂNG NHẬP</button>
+          </form>
+          <script>
+            async function markIssued() {
+              await fetch("/otp-live/mark-issued", { method: "POST" });
+            }
+
+            function mountOtpStep() {
+              document.body.innerHTML = \`
+                <form id="loginForm">
+                  <div>Xin vui lòng nhập mã xác thực OTP của bạn</div>
+                  <input id="passOTP" name="validate_pass_otp" type="text" />
+                  <button>ĐĂNG NHẬP</button>
+                </form>
+              \`;
+              document.getElementById("loginForm").addEventListener("submit", (event) => {
+                event.preventDefault();
+                const otpCode = document.getElementById("passOTP").value;
+                if (otpCode === "728989") {
+                  document.cookie = "session_otp_live=ok; path=/";
+                  window.location.href = "/records-otp-live";
+                }
+              });
+            }
+
+            document.getElementById("login-form").addEventListener("submit", async (event) => {
+              event.preventDefault();
+              const username = document.querySelector('[data-field="username"]').value;
+              const password = document.querySelector('[data-field="password"]').value;
+              if (username === "demo" && password === "secret") {
+                await markIssued();
+                mountOtpStep();
+              }
+            });
+          </script>
+        `),
+      );
+      return;
+    }
+
+    if (request.method === "POST" && url.pathname === "/otp-live/mark-issued") {
+      otpIssueCount += 1;
+      response.setHeader("content-type", "application/json");
+      response.end(JSON.stringify({ ok: true, otpIssueCount }));
+      return;
+    }
+
+    if (request.method === "GET" && url.pathname === "/records-otp-live") {
+      if (!cookie.includes("session_otp_live=ok")) {
+        response.statusCode = 302;
+        response.setHeader("location", "/login-otp-live");
+        response.end();
+        return;
+      }
+
+      response.setHeader("content-type", "text/html; charset=utf-8");
+      response.end(
+        html(`
+          <main data-authenticated="true">
+            <article>
+              <h1>Live OTP Challenge</h1>
+              <p>Successful auth after resuming the same OTP challenge page.</p>
+            </article>
+          </main>
+        `),
+      );
+      return;
+    }
+
     if (request.method === "GET" && url.pathname === "/otp/latest") {
       response.setHeader("content-type", "application/json");
       response.end(JSON.stringify({ code: "654321" }));
@@ -358,6 +436,9 @@ export async function createFixtureServer(): Promise<FixtureServer> {
   return {
     baseUrl: `http://127.0.0.1:${address.port}`,
     deliveries,
+    get otpIssueCount() {
+      return otpIssueCount;
+    },
     async close() {
       await new Promise<void>((resolve, reject) => {
         server.close((error) => {
